@@ -1,59 +1,75 @@
 import os
 import math
-import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
-from together import Together
+from openai import OpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-load_dotenv()
-API_KEY = os.getenv("TOGETHER_API_KEY")
 
-st.set_page_config(page_title="RAG Chatbot (Python 3.13)", page_icon="🤖")
-st.title("RAG Chatbot using Together.ai")
+# ----------- Setup -----------
+
+load_dotenv()
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+st.set_page_config(page_title="RAG Chatbot (OpenRouter)", page_icon="🤖")
+st.title("📚 RAG Chatbot using OpenRouter")
 
 if not API_KEY:
-    st.error("⚠ Add TOGETHER_API_KEY in a .env file.")
+    st.error("⚠ Add your OPENROUTER_API_KEY to .env")
     st.stop()
 
+client = OpenAI(
+    api_key=API_KEY,
+    base_url="https://openrouter.ai/api/v1"
+)
+
+
 with st.sidebar:
-    st.header("Settings")
-    model = st.selectbox(
-        "LLM Model",
+    st.header("⚙️ Settings")
+    llm_model = st.selectbox(
+        "Chat Model",
         [
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            "microsoft/Phi-3-mini-128k-instruct",
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.3",
         ],
     )
-    chunk_size = st.slider("Chunk size", 300, 2000, 800)
+    embedding_model = "text-embedding-3-small"   # fixed good embedding model
+
+    chunk_size = st.slider("Chunk Size", 300, 2000, 800)
     overlap = st.slider("Overlap", 0, 500, 200)
-    k = st.slider("Top K retrieved chunks", 1, 10, 4)
+    k = st.slider("Top K Retrieved Chunks", 1, 10, 4)
 
 uploaded = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"], accept_multiple_files=True)
 
 if "store" not in st.session_state:
     st.session_state.store = None
 
-client = Together()
 
-# HELPERS
+# ----------- Helper Functions -----------
+
 def load_text(file):
     if file.name.endswith(".txt"):
         return file.read().decode("utf-8")
     elif file.name.endswith(".pdf"):
         reader = PdfReader(file)
-        return "\n".join(page.extract_text() for page in reader.pages)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     return ""
 
 
 def embed_texts(texts):
+    """Embeds multiple texts using OpenRouter."""
     response = client.embeddings.create(
-        model="togethercomputer/m2-bert-80M-2k-retrieval",
+        model=embedding_model,
         input=texts
     )
-    return [d.embedding for d in response.data]
+
+    # If 1 item → return single vector
+    if isinstance(texts, str) or len(texts) == 1:
+        return [response.data[0].embedding]
+
+    return [item.embedding for item in response.data]
 
 
 def cosine(a, b):
@@ -63,7 +79,8 @@ def cosine(a, b):
     return dot / (na * nb) if na and nb else 0
 
 
-# BUILD KB 
+# ----------- Build Knowledge Base -----------
+
 if uploaded and st.button("Build Knowledge Base"):
     st.session_state.store = []
     texts = []
@@ -77,19 +94,22 @@ if uploaded and st.button("Build Knowledge Base"):
             st.session_state.store.append({"source": f.name, "text": c})
             texts.append(c)
 
-    embeddings = embed_texts(texts)
+    with st.spinner("Generating embeddings via OpenRouter..."):
+        embeddings = embed_texts(texts)
+
     for i, emb in enumerate(embeddings):
         st.session_state.store[i]["embedding"] = emb
 
-    st.success(f"Indexed {len(st.session_state.store)} document chunks.")
+    st.success(f"Indexed {len(st.session_state.store)} chunks!")
 
 
-# CHAT 
+# ----------- Chat -----------
+
 query = st.text_input("Ask a question:")
 
 if st.button("Ask") and query:
     if not st.session_state.store:
-        st.error("Upload files first")
+        st.error("⚠ Build the knowledge base first")
     else:
         q_emb = embed_texts([query])[0]
 
@@ -99,12 +119,11 @@ if st.button("Ask") and query:
             reverse=True
         )[:k]
 
-        context = "\n\n".join(
-            f"[{item['source']}]\n{item['text']}" for item in ranked
-        )
+        context = "\n\n".join(f"[{item['source']}]\n{item['text']}" for item in ranked)
 
         prompt = f"""
-You are a helpful assistant. Answer using ONLY the context below.
+Use ONLY the information below to answer the question.
+If the answer isn't found in the context, reply: "I don't know."
 
 Context:
 {context}
@@ -112,18 +131,19 @@ Context:
 Question: {query}
 
 Answer:
-        """
+"""
 
         response = client.chat.completions.create(
-            model=model,
+            model=llm_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300
+            max_tokens=400
         )
 
-        answer = response.choices[0].message["content"]
-        st.write("### Answer:")
-        st.write(answer)
+        bot_reply = response.choices[0].message.content
 
-        with st.expander("Sources"):
+        st.write("### 🤖 Answer:")
+        st.write(bot_reply)
+
+        with st.expander("📎 Sources used"):
             for r in ranked:
                 st.write(f"- {r['source']}")
